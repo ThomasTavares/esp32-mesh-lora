@@ -8,7 +8,7 @@
 #include <WebServer.h>
 
 #define RH_MESH_MAX_MESSAGE_LEN 50
-#define BRIDGE_ADDRESS 1  // address of the bridge
+#define BRIDGE_ADDRESS 1  
 
 // lilygo T3 v2.1.6
 // lora SX1276/8
@@ -26,7 +26,7 @@
 uint8_t nodeAddress;
 
 // Singleton instance of the radio driver
-RH_RF95 rf95(LLG_CS, LLG_DI0); // slave select pin and interrupt pin
+RH_RF95 rf95(LLG_CS, LLG_DI0);
 
 // Class to manage message delivery and receipt, using the driver declared above (temporary address)
 RHMesh manager(rf95, 255);
@@ -34,11 +34,28 @@ RHMesh manager(rf95, 255);
 // Initialize WebServer on port 80
 WebServer server(80);
 
+// Application-Level Flooding Variables
+#define HISTORY_SIZE 10
+String messageHistory[HISTORY_SIZE];
+uint8_t historyIndex = 0;
+uint16_t msgCounter = 0;
+
+bool isMessageNew(String msg) {
+    for (int i = 0; i < HISTORY_SIZE; i++)
+        if (messageHistory[i] == msg) return false;
+    return true;
+}
+
+void saveMessage(String msg) {
+    messageHistory[historyIndex] = msg;
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+}
+
 void handleRoot() {
     String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
     html += "<h2>Sistema Armando - Ponto de Acesso " + String(nodeAddress) + "</h2>";
     html += "<form action=\"/send\" method=\"POST\">";
-    html += "Mensagem: <input type=\"text\" name=\"msg\" maxlength=\"49\"><br><br>";
+    html += "Mensagem: <input type=\"text\" name=\"msg\" maxlength=\"35\"><br><br>"; // Max length as 35 to leave room for the ID prefix
     html += "<input type=\"submit\" value=\"Enviar\">";
     html += "</form></body></html>";
     server.send(200, "text/html", html);
@@ -46,18 +63,25 @@ void handleRoot() {
 
 void handleSend() {
     if (server.hasArg("msg")) {
-        String msg = server.arg("msg");
+        String originalMsg = server.arg("msg");
+        
+        // Format: "NodeID_Counter|Message"
+        String payload = String(nodeAddress) + "_" + String(msgCounter++) + "|" + originalMsg;
+        
         uint8_t data[RH_MESH_MAX_MESSAGE_LEN];
-        msg.getBytes(data, RH_MESH_MAX_MESSAGE_LEN);
+        payload.getBytes(data, RH_MESH_MAX_MESSAGE_LEN);
         
-        Serial.print("Enviando via web para o ponto intermediário: ");
-        Serial.println(msg);
+        Serial.print("Iniciando flood (broadcast): ");
+        Serial.println(payload);
         
-        // Send a message to the bridge
-        uint8_t res = manager.sendtoWait(data, msg.length() + 1, BRIDGE_ADDRESS);
+        // Save to local history to prevent rebroadcasting this message
+        saveMessage(payload);
+        
+        // Send a message to the broadcast address
+        uint8_t res = manager.sendtoWait(data, payload.length() + 1, RH_BROADCAST_ADDRESS);
         
         if (res == RH_ROUTER_ERROR_NONE) {
-            server.send(200, "text/plain", "Mensagem enviada com sucesso.");
+            server.send(200, "text/plain", "Mensagem enviada com sucesso para a rede.");
         } else {
             server.send(500, "text/plain", "Falha no envio. Erro: " + String(res));
         }
@@ -103,7 +127,7 @@ void setup() {
 
     // Set power and frequency
     rf95.setTxPower(10, false);
-    rf95.setFrequency(915.0);
+    rf95.setFrequency(915.0);   // Frequency for Brasil (915 MHz)
     rf95.setCADTimeout(500);
 
     if (!rf95.setModemConfig(RH_RF95::Bw125Cr45Sf128)) {
@@ -131,32 +155,41 @@ void loop()
     // Handle incoming HTTP requests
     server.handleClient();
 
-    // radio needs to stay always in receive mode (to process/forward messages)
+    // radio needs to stay always in receive mode
     uint8_t len = sizeof(buf);
     uint8_t from;
     if (manager.recvfromAck(buf, &len, &from))
     {
-        Serial.print("message from node n.");
-        Serial.print(from);
-        Serial.print(": ");
-        Serial.print((char*)buf);
-        Serial.print(" rssi: ");
-        Serial.println(rf95.lastRssi());
+        String receivedPayload = String((char*)buf);
+        
+        // Only process and rebroadcast if we haven't seen this message before
+        if (isMessageNew(receivedPayload)) {
+            // Save it to history
+            saveMessage(receivedPayload);
+            
+            // Extract the actual message (ignoring the ID prefix)
+            int separatorIndex = receivedPayload.indexOf('|');
+            String displayMsg = (separatorIndex != -1) ? receivedPayload.substring(separatorIndex + 1) : receivedPayload;
+            
+            Serial.print("Mensagem recebida do nó ");
+            Serial.print(from);
+            Serial.print(": ");
+            Serial.print(displayMsg);
+            Serial.print(" rssi: ");
+            Serial.println(rf95.lastRssi());
+            
+            // Re-broadcast to the next hop (flooding)
+            manager.sendtoWait(buf, len, RH_BROADCAST_ADDRESS);
+        }
     }
 }
 
 extern "C" void app_main()
 {
-    // Initialize the Arduino environment
     initArduino(); 
-    
-    // Call your node configuration
     setup();
-    
-    // Replicate the standard Arduino loop execution
     while (true) {
         loop();
-        // Yield to the underlying RTOS to prevent Watchdog Timer (WDT) resets
         vTaskDelay(10 / portTICK_PERIOD_MS); 
     }
 }
