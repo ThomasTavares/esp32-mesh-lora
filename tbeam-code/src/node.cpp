@@ -10,8 +10,6 @@
 #define RH_MESH_MAX_MESSAGE_LEN 50
 #define BRIDGE_ADDRESS 1  // address of the bridge
 
-#define NODE_ADDRESS 3    // address of this node
-
 // lilygo T3 v2.1.6
 // lora SX1276/8
 #define LLG_SCK 5
