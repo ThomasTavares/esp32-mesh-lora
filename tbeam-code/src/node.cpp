@@ -4,10 +4,12 @@
 #include <RHMesh.h>
 #include <RH_RF95.h>
 #include <SPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 #define RH_MESH_MAX_MESSAGE_LEN 50
-
 #define BRIDGE_ADDRESS 1  // address of the bridge
+
 #define NODE_ADDRESS 3    // address of this node
 
 // lilygo T3 v2.1.6
@@ -23,29 +25,70 @@
 
 #define LLG_LED_GRN 25
 
-// tfcard
-#define LLG_SD_CS   13
-#define LLG_SD_MISO 2
-#define LLG_SD_MOSI 15
-#define LLG_SD_SCK  14
-
-#define TXINTERVAL 3000  // delay between successive transmissions
-unsigned long nextTxTime;
+uint8_t nodeAddress;
 
 // Singleton instance of the radio driver
 RH_RF95 rf95(LLG_CS, LLG_DI0); // slave select pin and interrupt pin
 
-// Class to manage message delivery and receipt, using the driver declared above
-RHMesh manager(rf95, NODE_ADDRESS);
+// Class to manage message delivery and receipt, using the driver declared above (temporary address)
+RHMesh manager(rf95, 255);
 
-void setup() 
-{
+// Initialize WebServer on port 80
+WebServer server(80);
+
+void handleRoot() {
+    String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
+    html += "<h2>Sistema Armando - Ponto de Acesso " + String(nodeAddress) + "</h2>";
+    html += "<form action=\"/send\" method=\"POST\">";
+    html += "Mensagem: <input type=\"text\" name=\"msg\" maxlength=\"49\"><br><br>";
+    html += "<input type=\"submit\" value=\"Enviar\">";
+    html += "</form></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleSend() {
+    if (server.hasArg("msg")) {
+        String msg = server.arg("msg");
+        uint8_t data[RH_MESH_MAX_MESSAGE_LEN];
+        msg.getBytes(data, RH_MESH_MAX_MESSAGE_LEN);
+        
+        Serial.print("Enviando via web para o ponto intermediário: ");
+        Serial.println(msg);
+        
+        // Send a message to the bridge
+        uint8_t res = manager.sendtoWait(data, msg.length() + 1, BRIDGE_ADDRESS);
+        
+        if (res == RH_ROUTER_ERROR_NONE) {
+            server.send(200, "text/plain", "Mensagem enviada com sucesso.");
+        } else {
+            server.send(500, "text/plain", "Falha no envio. Erro: " + String(res));
+        }
+    } else {
+        server.send(400, "text/plain", "Parâmetro 'msg' ausente.");
+    }
+}
+
+void setup() {
     Serial.begin(115200);
+
+    // Generate unique ID based on MAC Address
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    nodeAddress = mac[5];
+    
+    // Ensure the ID is not the bridge address (1) and not broadcast (255)
+    if (nodeAddress == BRIDGE_ADDRESS || nodeAddress == 0 || nodeAddress == 255) {
+        nodeAddress = (mac[4] % 253) + 2; 
+    }
+    
+    // Update the mesh manager with the generated ID
+    manager.setThisAddress(nodeAddress);
+
     Serial.print(F("initializing node "));
-    Serial.print(NODE_ADDRESS); // address of this node
+    Serial.println(nodeAddress);
 
     // Hardware Reset the LoRa chip
-    pinMode(LLG_RST, OUTPUT); // LLG_RST is defined as 23
+    pinMode(LLG_RST, OUTPUT);
     digitalWrite(LLG_RST, LOW);
     delay(10);
     digitalWrite(LLG_RST, HIGH);
@@ -62,55 +105,35 @@ void setup()
 
     // Set power and frequency
     rf95.setTxPower(10, false);
-    rf95.setFrequency(868.0);
+    rf95.setFrequency(915.0);
     rf95.setCADTimeout(500);
 
-    boolean longRange = false;
-    if (longRange) 
-    {
-        RH_RF95::ModemConfig modem_config = {
-            0x78, // Reg 0x1D: BW=125kHz, Coding=4/8, Header=explicit
-            0xC4, // Reg 0x1E: Spread=4096chips/symbol, CRC=enable
-            0x08  // Reg 0x26: LowDataRate=On, Agc=Off
-        };
-        rf95.setModemRegisters(&modem_config);
-    }
-    else
-    {
-        if (!rf95.setModemConfig(RH_RF95::Bw125Cr45Sf128)) {
-            Serial.println(F("set config failed"));
-        }
+    if (!rf95.setModemConfig(RH_RF95::Bw125Cr45Sf128)) {
+        Serial.println(F("set config failed"));
     }
 
     Serial.println("RF95 ready");
-    nextTxTime = millis();
+
+    // Start WiFi Access Point
+    String ssid = "LoRa_Node_" + String(nodeAddress);
+    WiFi.softAP(ssid.c_str(), "disaster123");
+    Serial.print("AP IP address: ");
+    Serial.println(WiFi.softAPIP());
+
+    // Configure WebServer routes
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/send", HTTP_POST, handleSend);
+    server.begin();
 }
 
-uint8_t data[] = "Hello World!";
 uint8_t buf[RH_MESH_MAX_MESSAGE_LEN];
-uint8_t res;
 
 void loop()
 {
-    // send message every TXINTERVAL millisecs
-    if (millis() > nextTxTime) {
-        nextTxTime += TXINTERVAL;
-        Serial.print("Sending to bridge n.");
-        Serial.print(BRIDGE_ADDRESS);
-        Serial.print(" res=");
+    // Handle incoming HTTP requests
+    server.handleClient();
 
-        // Send a message to a rf95_mesh_server
-        // A route to the destination will be automatically discovered.
-        res = manager.sendtoWait(data, sizeof(data), BRIDGE_ADDRESS);
-        Serial.println(res);
-        if (res != RH_ROUTER_ERROR_NONE)
-        {
-            // Data not delivered to the next node.
-            Serial.println("sendtoWait failed. Are the bridge/intermediate mesh nodes running?");
-        }
-    }
-
-    // radio needs to stay always in receive mode ( to process/forward messages )
+    // radio needs to stay always in receive mode (to process/forward messages)
     uint8_t len = sizeof(buf);
     uint8_t from;
     if (manager.recvfromAck(buf, &len, &from))
@@ -120,7 +143,7 @@ void loop()
         Serial.print(": ");
         Serial.print((char*)buf);
         Serial.print(" rssi: ");
-        Serial.println(rf95.lastRssi()); 
+        Serial.println(rf95.lastRssi());
     }
 }
 
