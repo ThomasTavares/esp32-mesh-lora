@@ -7,36 +7,35 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HardwareSerial.h>
+#include <TinyGPSPlus.h>
+
 #include "cose.h"
 
 #define RH_MESH_MAX_MESSAGE_LEN 200
 
-// lilygo T3 v2.1.6
-// lora SX1276/8
+// LoRa Pins
 #define LLG_SCK 5
 #define LLG_MISO 19
 #define LLG_MOSI 27
 #define LLG_CS  18
 #define LLG_RST 23
 #define LLG_DI0 26
-#define LLG_DI1 33
-#define LLG_DI2 32
 
-#define LLG_LED_GRN 25
+// GPS Pins (T-Beam v0.7 standard)
+#define GPS_RX_PIN 12
+#define GPS_TX_PIN 15
 
 Preferences preferences;
 uint8_t symmetricKey[32]; // 256-bit AES key
-
 uint8_t nodeAddress;
 
-// Singleton instance of the radio driver
+// Hardware drivers
 RH_RF95 rf95(LLG_CS, LLG_DI0);
-
-// Class to manage message delivery and receipt, using the driver declared above (temporary address)
 RHMesh manager(rf95, 255);
-
-// Initialize WebServer on port 80
 WebServer server(80);
+TinyGPSPlus gps;
+HardwareSerial GPS(1);
 
 // Application-Level Flooding Variables
 #define HISTORY_SIZE 10
@@ -77,8 +76,15 @@ void loadKey() {
 void handleRoot() {
     String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
     html += "<h2>Sistema Armando - Ponto de Acesso " + String(nodeAddress) + "</h2>";
+    
+    // Display current GPS status
+    String gpsStatus = gps.location.isValid() ? 
+                       (String(gps.location.lat(), 6) + ", " + String(gps.location.lng(), 6)) : 
+                       "Buscando satelites...";
+    html += "<p><b>Localizacao GPS:</b> " + gpsStatus + "</p>";
+    
     html += "<form action=\"/send\" method=\"POST\">";
-    html += "Mensagem: <input type=\"text\" name=\"msg\" maxlength=\"35\"><br><br>"; // Max length as 35 to leave room for the ID prefix
+    html += "Mensagem: <input type=\"text\" name=\"msg\" maxlength=\"35\"><br><br>";
     html += "<input type=\"submit\" value=\"Enviar\">";
     html += "</form></body></html>";
     server.send(200, "text/html", html);
@@ -88,35 +94,34 @@ void handleSend() {
     if (server.hasArg("msg")) {
         String originalMsg = server.arg("msg");
         
-        // Format: "NodeID_Counter|Message"
-        String payload = String(nodeAddress) + "_" + String(msgCounter++) + "|" + originalMsg;
+        // Fetch valid coordinates or default to 0.0
+        String lat = gps.location.isValid() ? String(gps.location.lat(), 6) : "0.0";
+        String lng = gps.location.isValid() ? String(gps.location.lng(), 6) : "0.0";
+        String gpsCoords = lat + "," + lng;
 
-        // Convert plaintext to std::vector for the CoseCrypto class
+        // Protocol Format: "NodeID_Counter|Message|Lat,Lng"
+        String payload = String(nodeAddress) + "_" + String(msgCounter++) + "|" + originalMsg + "|" + gpsCoords;
+        
+        // Save the PLAINTEXT to local history to prevent rebroadcasting our own message
+        saveMessage(payload);
+        
+        // Convert to vector for encryption
         std::vector<uint8_t> plaintext(payload.c_str(), payload.c_str() + payload.length());
         std::vector<uint8_t> key(symmetricKey, symmetricKey + 32);
         std::vector<uint8_t> ciphertext;
-
-        // Encrypt payload to CBOR format
-        if (CoseCrypto::encrypt(plaintext, key, ciphertext) != ESP_OK) {
-            Serial.println("[SECURITY] Falha ao encriptar a mensagem!");
+        
+        // Encrypt payload to COSE format
+        if (CoseCrypto::encrypt(plaintext, key, ciphertext) != ESP_OK || ciphertext.size() > RH_MESH_MAX_MESSAGE_LEN) {
+            Serial.println("[SECURITY] Falha ao encriptar a mensagem ou buffer excedido!");
             server.send(500, "text/plain", "Erro interno de criptografia.");
             return;
         }
 
-        // Prevent buffer overflows in the radio driver
-        if (ciphertext.size() > RH_MESH_MAX_MESSAGE_LEN) {
-            server.send(500, "text/plain", "Mensagem excedeu o limite de bytes após encriptação COSE.");
-            return;
-        }
-        
-        Serial.print("Iniciando flood seguro. Tamanho do pacote COSE: ");
+        Serial.print("Iniciando flood seguro. Tamanho: ");
         Serial.print(ciphertext.size());
         Serial.println(" bytes.");
         
-        // Save to local history to prevent rebroadcasting this message
-        saveMessage(payload);
-        
-        // Send the encrypted vector over the mesh
+        // Send the encrypted vector
         uint8_t res = manager.sendtoWait(ciphertext.data(), ciphertext.size(), RH_BROADCAST_ADDRESS);
         
         if (res == RH_ROUTER_ERROR_NONE) {
@@ -135,17 +140,16 @@ void setup() {
     // Load the AES key from NVS memory before turning on the radio
     loadKey();
 
+    // Initialize GPS UART
+    GPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
     // Generate unique ID based on MAC Address
     uint8_t mac[6];
     WiFi.macAddress(mac);
     nodeAddress = mac[5];
-    
-    // Ensure the ID is not broadcast (255)
     if (nodeAddress == 0 || nodeAddress == 255) {
         nodeAddress = (mac[4] % 253) + 2; 
     }
-    
-    // Update the mesh manager with the generated ID
     manager.setThisAddress(nodeAddress);
 
     Serial.print(F("initializing node "));
@@ -158,7 +162,7 @@ void setup() {
     digitalWrite(LLG_RST, HIGH);
     delay(10);
 
-    // Initialize SPI with the correct pins for T-Beam v0.7
+    // Initialize SPI
     SPI.begin(LLG_SCK, LLG_MISO, LLG_MOSI, LLG_CS);
 
     if (!manager.init()) {
@@ -179,8 +183,8 @@ void setup() {
     Serial.println("RF95 ready");
 
     // Start WiFi Access Point
-    String ssid = "LoRa_Node_" + String(nodeAddress);
-    WiFi.softAP(ssid.c_str(), "disaster123");
+    String ssid = "Armando - " + String(nodeAddress);
+    WiFi.softAP(ssid.c_str(), "senha_armando");
     Serial.print("AP IP address: ");
     Serial.println(WiFi.softAPIP());
 
@@ -197,9 +201,15 @@ void loop()
     // Handle incoming HTTP requests
     server.handleClient();
 
-    // radio needs to stay always in receive mode
+    // Process incoming NMEA sentences from the GPS module
+    while (GPS.available() > 0) {
+        gps.encode(GPS.read());
+    }
+
     uint8_t len = sizeof(buf);
     uint8_t from;
+
+    // Check for incoming mesh data
     if (manager.recvfromAck(buf, &len, &from))
     {
         // Load the incoming buffer directly into a vector
@@ -212,21 +222,28 @@ void loop()
             
             if (isMessageNew(receivedPayload)) {
                 saveMessage(receivedPayload);
+
+                // Parse the "ID_Count|Message|Lat,Lng" format
+                int firstPipe = receivedPayload.indexOf('|');
+                int secondPipe = receivedPayload.indexOf('|', firstPipe + 1);
                 
-                int separatorIndex = receivedPayload.indexOf('|');
-                String displayMsg = (separatorIndex != -1) ? receivedPayload.substring(separatorIndex + 1) : receivedPayload;
+                String displayMsg = receivedPayload;
+                String gpsData = "Desconhecido";
+
+                if (firstPipe != -1 && secondPipe != -1) {
+                    displayMsg = receivedPayload.substring(firstPipe + 1, secondPipe);
+                    gpsData = receivedPayload.substring(secondPipe + 1);
+                } else if (firstPipe != -1) {
+                    displayMsg = receivedPayload.substring(firstPipe + 1);
+                }
                 
-                Serial.print("Mensagem decifrada do nó ");
-                Serial.print(from);
-                Serial.print(": ");
-                Serial.print(displayMsg);
-                Serial.print(" rssi: ");
-                Serial.println(rf95.lastRssi());
+                Serial.printf("Mensagem segura do nó %d | Msg: %s | GPS: %s | rssi: %d\n", 
+                              from, displayMsg.c_str(), gpsData.c_str(), rf95.lastRssi());
                 
-                manager.sendtoWait(buf, len, RH_BROADCAST_ADDRESS); // Re-broadcast the original ciphertext
+                manager.sendtoWait(buf, len, RH_BROADCAST_ADDRESS); // Re-broadcast the original encrypted packet
             }
         } else {
-            Serial.println("[SECURITY] Falha de autenticação. Pacote COSE ignorado ou corrompido.");
+            Serial.println("[SECURITY] Pacote ignorado. Falha na decodificação COSE.");
         }
     }
 }
