@@ -10,7 +10,6 @@
 #include "cose.h"
 
 #define RH_MESH_MAX_MESSAGE_LEN 200
-#define BRIDGE_ADDRESS 1  
 
 // lilygo T3 v2.1.6
 // lora SX1276/8
@@ -141,8 +140,8 @@ void setup() {
     WiFi.macAddress(mac);
     nodeAddress = mac[5];
     
-    // Ensure the ID is not the bridge address (1) and not broadcast (255)
-    if (nodeAddress == BRIDGE_ADDRESS || nodeAddress == 0 || nodeAddress == 255) {
+    // Ensure the ID is not broadcast (255)
+    if (nodeAddress == 0 || nodeAddress == 255) {
         nodeAddress = (mac[4] % 253) + 2; 
     }
     
