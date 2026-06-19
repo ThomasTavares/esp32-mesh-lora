@@ -1,13 +1,15 @@
 #include "Arduino.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <Preferences.h>
 #include <RHMesh.h>
 #include <RH_RF95.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "cose.h"
 
-#define RH_MESH_MAX_MESSAGE_LEN 50
+#define RH_MESH_MAX_MESSAGE_LEN 200
 #define BRIDGE_ADDRESS 1  
 
 // lilygo T3 v2.1.6
@@ -22,6 +24,9 @@
 #define LLG_DI2 32
 
 #define LLG_LED_GRN 25
+
+Preferences preferences;
+uint8_t symmetricKey[32]; // 256-bit AES key
 
 uint8_t nodeAddress;
 
@@ -51,6 +56,25 @@ void saveMessage(String msg) {
     historyIndex = (historyIndex + 1) % HISTORY_SIZE;
 }
 
+void loadKey() {
+    preferences.begin("crypto", true);
+    
+    if (preferences.getBytesLength("aes_key") == 32) {  // Check if the key length is 32 bytes (256 bits)
+        preferences.getBytes("aes_key", symmetricKey, 32);
+        Serial.println("[SECURITY] 256-bit AES Master Key successfully loaded from NVS.");
+    } else {
+        Serial.println("\n[ERROR] CRITICAL SECURITY FAILURE!");
+        Serial.println("[ERROR] AES key not found in NVS or invalid length.");
+        Serial.println("[ERROR] Verify that the PlatformIO extra_script flashed nvs_key.bin successfully.");
+        
+        // Halt execution indefinitely to prevent unencrypted transmissions
+        while(true) { 
+            vTaskDelay(1000 / portTICK_PERIOD_MS); 
+        }
+    }
+    preferences.end();
+}
+
 void handleRoot() {
     String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
     html += "<h2>Sistema Armando - Ponto de Acesso " + String(nodeAddress) + "</h2>";
@@ -67,23 +91,39 @@ void handleSend() {
         
         // Format: "NodeID_Counter|Message"
         String payload = String(nodeAddress) + "_" + String(msgCounter++) + "|" + originalMsg;
+
+        // Convert plaintext to std::vector for the CoseCrypto class
+        std::vector<uint8_t> plaintext(payload.c_str(), payload.c_str() + payload.length());
+        std::vector<uint8_t> key(symmetricKey, symmetricKey + 32);
+        std::vector<uint8_t> ciphertext;
+
+        // Encrypt payload to CBOR format
+        if (CoseCrypto::encrypt(plaintext, key, ciphertext) != ESP_OK) {
+            Serial.println("[SECURITY] Falha ao encriptar a mensagem!");
+            server.send(500, "text/plain", "Erro interno de criptografia.");
+            return;
+        }
+
+        // Prevent buffer overflows in the radio driver
+        if (ciphertext.size() > RH_MESH_MAX_MESSAGE_LEN) {
+            server.send(500, "text/plain", "Mensagem excedeu o limite de bytes após encriptação COSE.");
+            return;
+        }
         
-        uint8_t data[RH_MESH_MAX_MESSAGE_LEN];
-        payload.getBytes(data, RH_MESH_MAX_MESSAGE_LEN);
-        
-        Serial.print("Iniciando flood (broadcast): ");
-        Serial.println(payload);
+        Serial.print("Iniciando flood seguro. Tamanho do pacote COSE: ");
+        Serial.print(ciphertext.size());
+        Serial.println(" bytes.");
         
         // Save to local history to prevent rebroadcasting this message
         saveMessage(payload);
         
-        // Send a message to the broadcast address
-        uint8_t res = manager.sendtoWait(data, payload.length() + 1, RH_BROADCAST_ADDRESS);
+        // Send the encrypted vector over the mesh
+        uint8_t res = manager.sendtoWait(ciphertext.data(), ciphertext.size(), RH_BROADCAST_ADDRESS);
         
         if (res == RH_ROUTER_ERROR_NONE) {
-            server.send(200, "text/plain", "Mensagem enviada com sucesso para a rede.");
+            server.send(200, "text/plain", "Mensagem segura enviada para a rede.");
         } else {
-            server.send(500, "text/plain", "Falha no envio. Erro: " + String(res));
+            server.send(500, "text/plain", "Falha no envio via LoRa. Erro: " + String(res));
         }
     } else {
         server.send(400, "text/plain", "Parâmetro 'msg' ausente.");
@@ -92,6 +132,9 @@ void handleSend() {
 
 void setup() {
     Serial.begin(115200);
+
+    // Load the AES key from NVS memory before turning on the radio
+    loadKey();
 
     // Generate unique ID based on MAC Address
     uint8_t mac[6];
@@ -160,26 +203,31 @@ void loop()
     uint8_t from;
     if (manager.recvfromAck(buf, &len, &from))
     {
-        String receivedPayload = String((char*)buf);
-        
-        // Only process and rebroadcast if we haven't seen this message before
-        if (isMessageNew(receivedPayload)) {
-            // Save it to history
-            saveMessage(receivedPayload);
+        // Load the incoming buffer directly into a vector
+        std::vector<uint8_t> ciphertext(buf, buf + len);
+        std::vector<uint8_t> key(symmetricKey, symmetricKey + 32);
+        std::vector<uint8_t> plaintext;
+
+        if (CoseCrypto::decrypt(ciphertext, key, plaintext) == ESP_OK) {
+            String receivedPayload((char*)plaintext.data(), plaintext.size());
             
-            // Extract the actual message (ignoring the ID prefix)
-            int separatorIndex = receivedPayload.indexOf('|');
-            String displayMsg = (separatorIndex != -1) ? receivedPayload.substring(separatorIndex + 1) : receivedPayload;
-            
-            Serial.print("Mensagem recebida do nó ");
-            Serial.print(from);
-            Serial.print(": ");
-            Serial.print(displayMsg);
-            Serial.print(" rssi: ");
-            Serial.println(rf95.lastRssi());
-            
-            // Re-broadcast to the next hop (flooding)
-            manager.sendtoWait(buf, len, RH_BROADCAST_ADDRESS);
+            if (isMessageNew(receivedPayload)) {
+                saveMessage(receivedPayload);
+                
+                int separatorIndex = receivedPayload.indexOf('|');
+                String displayMsg = (separatorIndex != -1) ? receivedPayload.substring(separatorIndex + 1) : receivedPayload;
+                
+                Serial.print("Mensagem decifrada do nó ");
+                Serial.print(from);
+                Serial.print(": ");
+                Serial.print(displayMsg);
+                Serial.print(" rssi: ");
+                Serial.println(rf95.lastRssi());
+                
+                manager.sendtoWait(buf, len, RH_BROADCAST_ADDRESS); // Re-broadcast the original ciphertext
+            }
+        } else {
+            Serial.println("[SECURITY] Falha de autenticação. Pacote COSE ignorado ou corrompido.");
         }
     }
 }
