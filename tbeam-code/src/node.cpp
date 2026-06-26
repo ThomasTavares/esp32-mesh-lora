@@ -9,9 +9,12 @@
 #include <WebServer.h>
 #include <HardwareSerial.h>
 #include <TinyGPSPlus.h>
+#include <Wire.h>
+#include <XPowersLib.h>
 
 #include "cose.h"
 
+#define TBEAM_1_2_VERSION true
 #define RH_MESH_MAX_MESSAGE_LEN 200
 
 // LoRa Pins
@@ -22,7 +25,7 @@
 #define LLG_RST 23
 #define LLG_DI0 26
 
-// GPS Pins (T-Beam v0.7 standard)
+// GPS Pins
 #define GPS_RX_PIN 12
 #define GPS_TX_PIN 15
 
@@ -36,6 +39,7 @@ RHMesh manager(rf95, 255);
 WebServer server(80);
 TinyGPSPlus gps;
 HardwareSerial GPS(1);
+XPowersAXP2101 PMU;
 
 // Application-Level Flooding Variables
 #define HISTORY_SIZE 10
@@ -136,6 +140,23 @@ void handleSend() {
 
 void setup() {
     Serial.begin(115200);
+
+    if (TBEAM_1_2_VERSION) {
+        Wire.begin(21, 22);
+        if (PMU.init(Wire, AXP2101_SLAVE_ADDRESS)) {
+            Serial.println("AXP2101 PMU initialized.");
+            
+            // Turn on power to the LoRa Radio
+            PMU.setALDO2Voltage(3300);
+            PMU.enableALDO2();
+            
+            // Turn on power to the GPS
+            PMU.setALDO3Voltage(3300);
+            PMU.enableALDO3();
+            
+            Serial.println("LoRa and GPS Power rails enabled.");
+        }
+    }
 
     // Load the AES key from NVS memory before turning on the radio
     loadKey();
